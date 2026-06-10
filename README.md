@@ -89,6 +89,13 @@ var r = html.tokenizeLine("color: red", state)
 | Scope stacks             | ✅ accumulated root → leaf per token |
 | Theme resolution         | ✅ VS Code themes → per-token color + font style |
 
+Robust by design: a rule whose regex uses an oniguruma feature `@chuks/pcre`
+doesn't support is skipped (the grammar still loads), the `end` pattern has
+TextMate's default priority, and `captures` accept both the `{name}` and bare
+string forms. Validated against the real Shiki grammars for 21 languages
+(TypeScript, JS, Python, Go, Rust, Java, C/C++, C#, Ruby, PHP, Swift, Kotlin,
+HTML, CSS, JSON, YAML, Bash, SQL, Markdown, Chuks).
+
 Not yet supported: `while` rules and injection grammars — on the roadmap.
 
 ## API

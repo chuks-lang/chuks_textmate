@@ -1,7 +1,7 @@
 {
   "author": "Chuks Team",
   "dependencies": {
-    "@chuks/pcre": "^0.2.0"
+    "@chuks/pcre": "^0.3.0"
   },
   "description": "A pure-Chuks TextMate grammar interpreter + theme resolver — tokenizes source into scoped spans and colors them from VS Code themes, with embedded-language support. A full Shiki-equivalent syntax highlighter, powered by @chuks/pcre. No Shiki, no oniguruma WASM.",
   "entry": "src/index.chuks",
@@ -9,5 +9,5 @@
   "license": "MIT",
   "name": "@chuks/textmate",
   "repository": "https://github.com/chuks-lang/chuks_textmate",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

@@ -269,12 +269,21 @@ export class Grammar {
 
     // ── matching ──────────────────────────────────────────────────────────────
 
-    // Earliest-winning candidate at `pos`. Child patterns are tried first;
-    // the end pattern wins only if it matches strictly earlier.
+    // Winning candidate at `pos`. The current region's `end` pattern has
+    // priority (TextMate's default applyEndPatternLast=false): a child must
+    // match STRICTLY before the end to win; on a tie the region closes.
     private nextMatch(line: string, pos: int, frames: []Frame, topRule: Rule): Candidate? {
+        var endMatch: Match? = null
+        var endStart: int = -1
+        var endRule: Rule? = null
+        if (frames.length > 0) {
+            var top: Frame = frames[frames.length - 1]
+            var em: Match? = top.endRe.find(line, pos)
+            if (em != null) { endMatch = em; endStart = em.start(); endRule = top.rule }
+        }
+
         var best: Candidate? = null
         var bestStart: int = -1
-
         var candidates: []Rule = this.candidatesFor(topRule)
         for (var i: int = 0; i < candidates.length; i = i + 1) {
             var c: Rule = candidates[i]
@@ -282,23 +291,18 @@ export class Grammar {
             if (re == null) { continue }
             var m: Match? = re.find(line, pos)
             if (m == null) { continue }
-            if (best == null || m.start() < bestStart) {
+            var s: int = m.start()
+            if (endMatch != null && s >= endStart) { continue }   // end wins ties
+            if (best == null || s < bestStart) {
                 best = new Candidate(c, m, false)
-                bestStart = m.start()
-                if (bestStart == pos) { break }   // can't beat a match at the cursor
+                bestStart = s
+                if (s == pos) { break }   // can't beat a match at the cursor
             }
         }
 
-        if (frames.length > 0) {
-            var top: Frame = frames[frames.length - 1]
-            var em: Match? = top.endRe.find(line, pos)
-            if (em != null) {
-                if (best == null || em.start() < bestStart) {
-                    best = new Candidate(top.rule, em, true)
-                }
-            }
-        }
-        return best
+        if (best != null) { return best }
+        if (endMatch != null && endRule != null) { return new Candidate(endRule, endMatch, true) }
+        return null
     }
 
     // Include-resolved candidate list for a rule, cached on the rule. Resolution
@@ -475,14 +479,17 @@ function parseRule(r: any): Rule {
 
     if (r["match"] != null) {
         rule.kind = "match"
-        rule.matchRe = new Regex(string(r["match"]))
+        rule.matchRe = tryCompile(string(r["match"]))
+        // An uncompilable pattern (rare oniguruma feature) degrades to a
+        // no-op rule rather than crashing the whole grammar.
+        if (rule.matchRe == null) { rule.kind = "group" }
         rule.captures = parseCaptures(r["captures"])
         return rule
     }
 
     if (r["begin"] != null) {
         rule.kind = "beginEnd"
-        rule.beginRe = new Regex(string(r["begin"]))
+        rule.beginRe = tryCompile(string(r["begin"]))
         rule.beginCaptures = parseCaptures(r["beginCaptures"])
         // a shared "captures" applies to both begin and end when the specific
         // ones are absent
@@ -491,11 +498,16 @@ function parseRule(r: any): Rule {
         if (r["end"] != null) {
             rule.endSource = string(r["end"])
             rule.endHasBackref = hasBackref(rule.endSource)
-            if (!rule.endHasBackref) { rule.endRe = new Regex(rule.endSource) }
+            if (!rule.endHasBackref) {
+                rule.endRe = tryCompile(rule.endSource)
+                if (rule.endRe == null) { rule.beginRe = null }   // can't honor it → drop rule
+            }
         }
         rule.endCaptures = parseCaptures(r["endCaptures"])
         if (rule.endCaptures.keys().length == 0) { rule.endCaptures = shared }
         rule.patterns = parseRuleList(r["patterns"])
+        // If begin (or its end) wouldn't compile, neutralize the rule.
+        if (rule.beginRe == null) { rule.kind = "group"; rule.patterns = [] }
         return rule
     }
 
@@ -503,6 +515,17 @@ function parseRule(r: any): Rule {
     rule.kind = "group"
     rule.patterns = parseRuleList(r["patterns"])
     return rule
+}
+
+// Compile a regex, returning null instead of throwing when the pattern uses an
+// oniguruma feature @chuks/pcre doesn't support. Lets a single odd rule degrade
+// gracefully instead of taking down the whole grammar.
+function tryCompile(pattern: string): Regex? {
+    try {
+        return new Regex(pattern)
+    } catch (e: Error) {
+        return null
+    }
 }
 
 // captures: { "1": { "name": "scope" }, ... } → { "1": "scope" }
@@ -515,7 +538,8 @@ function parseCaptures(c: any): map[string]string {
         var k: string = string(keys[i])
         var entry: any = cm[k]
         if (entry == null) { continue }
-        if (entry["name"] != null) { out[k] = string(entry["name"]) }
+        if (typeof(entry) == "string") { out[k] = string(entry); continue }   // shorthand form
+        if (typeof(entry) == "map" && entry["name"] != null) { out[k] = string(entry["name"]) }
     }
     return out
 }
