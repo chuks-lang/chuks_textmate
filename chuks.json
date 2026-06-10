@@ -1,0 +1,13 @@
+{
+  "author": "Chuks Team",
+  "dependencies": {
+    "@chuks/pcre": "^0.2.0"
+  },
+  "description": "A pure-Chuks TextMate grammar interpreter — tokenizes source code into scoped spans using oniguruma-style grammars, powered by @chuks/pcre. Server-side syntax highlighting without Shiki/WASM.",
+  "entry": "src/index.chuks",
+  "keywords": ["textmate", "syntax-highlighting", "tokenizer", "grammar", "oniguruma", "shiki", "tmlanguage"],
+  "license": "MIT",
+  "name": "@chuks/textmate",
+  "repository": "https://github.com/chuks-lang/chuks_textmate",
+  "version": "0.1.0"
+}

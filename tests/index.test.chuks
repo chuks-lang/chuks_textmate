@@ -1,0 +1,141 @@
+// Tests for @chuks/textmate — pure-Chuks TextMate grammar interpreter.
+// Run: chuks run tests/index.test.chuks   (and AOT via chuks build)
+
+import { test } from "std/test"
+import { Grammar, GrammarState, LineTokens, Token } from "../src/index.chuks"
+
+var passed: int = 0
+var failed: int = 0
+var failures: []string = []
+const start = test.now()
+
+function ok(name: string, cond: bool) {
+    if (test.assert(cond, name)) { passed++ } else { failed++; failures.push(name) }
+}
+function eq(name: string, got: string, want: string) {
+    if (test.assertEqual(got, want, name)) { passed++ } else { failed++; failures.push(name + ": [" + got + "] != [" + want + "]") }
+}
+
+function lastScope(t: Token): string {
+    if (t.scopes.length == 0) { return "<none>" }
+    return t.scopes[t.scopes.length - 1]
+}
+function scopeAt(r: LineTokens, pos: int): string {
+    for (var i: int = 0; i < r.tokens.length; i = i + 1) {
+        var t: Token = r.tokens[i]
+        if (pos >= t.start && pos < t.end) { return lastScope(t) }
+    }
+    return "<gap>"
+}
+// full scope stack joined, for the token covering pos
+function scopesAt(r: LineTokens, pos: int): string {
+    for (var i: int = 0; i < r.tokens.length; i = i + 1) {
+        var t: Token = r.tokens[i]
+        if (pos >= t.start && pos < t.end) {
+            var s: string = ""
+            for (var j: int = 0; j < t.scopes.length; j = j + 1) {
+                if (j > 0) { s = s + " " }
+                s = s + t.scopes[j]
+            }
+            return s
+        }
+    }
+    return "<gap>"
+}
+
+// ─── Grammar 1: a small language ─────────────────────────────────────────────
+const G1: string = "{" +
+  "\"scopeName\": \"source.mini\"," +
+  "\"patterns\": [" +
+    "{ \"include\": \"#comment\" }," +
+    "{ \"include\": \"#block\" }," +
+    "{ \"include\": \"#string\" }," +
+    "{ \"include\": \"#keyword\" }," +
+    "{ \"include\": \"#number\" }," +
+    "{ \"include\": \"#func\" }" +
+  "]," +
+  "\"repository\": {" +
+    "\"comment\": { \"match\": \"//.*$\", \"name\": \"comment.line\" }," +
+    "\"block\": { \"begin\": \"/\\\\*\", \"end\": \"\\\\*/\", \"name\": \"comment.block\" }," +
+    "\"string\": {" +
+      "\"begin\": \"\\\"\", \"end\": \"\\\"\", \"name\": \"string.quoted.double\"," +
+      "\"patterns\": [ { \"match\": \"\\\\\\\\.\", \"name\": \"constant.character.escape\" } ]" +
+    "}," +
+    "\"keyword\": { \"match\": \"\\\\b(let|const|function|return)\\\\b\", \"name\": \"keyword.control\" }," +
+    "\"number\": { \"match\": \"\\\\b\\\\d+\\\\b\", \"name\": \"constant.numeric\" }," +
+    "\"func\": { \"match\": \"([a-zA-Z_]\\\\w*)\\\\s*(\\\\()\", \"captures\": { \"1\": { \"name\": \"entity.name.function\" }, \"2\": { \"name\": \"punctuation.paren\" } } }" +
+  "}" +
+"}"
+
+var g1: Grammar = Grammar.load(G1)
+var st: GrammarState = g1.initialState()
+
+// keywords / numbers
+var r: LineTokens = g1.tokenizeLine("let x = 42", st)
+eq("kw", scopeAt(r, 0), "keyword.control")
+eq("num", scopeAt(r, 8), "constant.numeric")
+
+// captures: function name + paren
+r = g1.tokenizeLine("foo(1)", g1.initialState())
+eq("cap-funcname", scopeAt(r, 0), "entity.name.function")
+eq("cap-paren", scopeAt(r, 3), "punctuation.paren")
+eq("cap-arg", scopeAt(r, 4), "constant.numeric")
+
+// line comment
+r = g1.tokenizeLine("return 7 // hi", g1.initialState())
+eq("cmt-kw", scopeAt(r, 0), "keyword.control")
+eq("cmt", scopeAt(r, 9), "comment.line")
+
+// string with escape, plus nested scope stack
+r = g1.tokenizeLine("\"a\\nb\"", g1.initialState())
+eq("str-quote", scopeAt(r, 0), "string.quoted.double")
+eq("str-escape", scopeAt(r, 2), "constant.character.escape")
+eq("str-scopestack", scopesAt(r, 2), "source.mini string.quoted.double constant.character.escape")
+
+// ─── Multiline: a block comment spanning three lines ─────────────────────────
+var ms: GrammarState = g1.initialState()
+var m1: LineTokens = g1.tokenizeLine("code /* start", ms)
+eq("ml-code", scopeAt(m1, 0), "source.mini")        // "code" — no rule, base scope only
+eq("ml-open", scopeAt(m1, 5), "comment.block")
+ms = m1.state
+var m2: LineTokens = g1.tokenizeLine("still inside", ms)   // entire line is comment
+eq("ml-mid", scopeAt(m2, 3), "comment.block")
+ms = m2.state
+var m3: LineTokens = g1.tokenizeLine("end */ let", ms)
+eq("ml-end", scopeAt(m3, 0), "comment.block")       // before close still comment
+eq("ml-after", scopeAt(m3, 7), "keyword.control")   // "let" after the close
+ok("ml-closed", m3.state.frames.length == 0)        // stack emptied after */
+
+// a string left open at end of line keeps state open
+var os: LineTokens = g1.tokenizeLine("\"unterminated", g1.initialState())
+ok("str-open-state", os.state.frames.length == 1)
+
+// ─── Grammar 2: heredoc with a backreference end ─────────────────────────────
+const G2: string = "{" +
+  "\"scopeName\": \"source.sh\"," +
+  "\"patterns\": [ { \"include\": \"#heredoc\" } ]," +
+  "\"repository\": {" +
+    "\"heredoc\": {" +
+      "\"begin\": \"<<(\\\\w+)\"," +
+      "\"end\": \"^\\\\1$\"," +
+      "\"name\": \"string.heredoc\"," +
+      "\"beginCaptures\": { \"1\": { \"name\": \"keyword.heredoc.delimiter\" } }" +
+    "}" +
+  "}" +
+"}"
+
+var g2: Grammar = Grammar.load(G2)
+var hs: GrammarState = g2.initialState()
+var h1: LineTokens = g2.tokenizeLine("<<END", hs)
+eq("hd-delim", scopeAt(h1, 2), "keyword.heredoc.delimiter")
+hs = h1.state
+var h2: LineTokens = g2.tokenizeLine("  body text", hs)
+eq("hd-body", scopeAt(h2, 2), "string.heredoc")
+hs = h2.state
+var h3: LineTokens = g2.tokenizeLine("nope", hs)   // wrong delimiter, still open
+ok("hd-still-open", h3.state.frames.length == 1)
+hs = h3.state
+var h4: LineTokens = g2.tokenizeLine("END", hs)    // matches \1 == "END" → closes
+ok("hd-closed", h4.state.frames.length == 0)
+
+test.report(passed, failed, failures, test.now() - start)

@@ -1,0 +1,491 @@
+// @chuks/textmate — a pure-Chuks TextMate grammar interpreter.
+//
+// Tokenizes source code into scoped spans using TextMate `.tmLanguage.json`
+// grammars, powered by @chuks/pcre (backtracking regex with the lookaround /
+// backreferences / `\G` anchor that grammars rely on). This is what drives
+// server-side syntax highlighting without Shiki or an oniguruma WASM blob.
+//
+//   import { Grammar } from "pkg/@chuks/textmate"
+//   var g = Grammar.load(grammarJsonString)
+//   var state = g.initialState()
+//   for (var line of sourceLines) {
+//       var r = g.tokenizeLine(line, state)
+//       // r.tokens: [{ start, end, scopes: [...] }]  ; r.state carries multiline context
+//       state = r.state
+//   }
+//
+// Supported grammar constructs: match rules with captures · begin/end rules
+// with begin/end/beginCaptures/endCaptures/contentName and nested patterns ·
+// includes ($self, $base, #repository-ref) · the repository · multiline state
+// carried across lines · backreference substitution in end patterns (heredocs).
+
+import { json } from "std/json"
+import { strings } from "std/strings"
+import { Regex, Match } from "pkg/@chuks/pcre"
+
+// ─── Grammar model ───────────────────────────────────────────────────────────
+
+// One node of the grammar. `kind` selects the live fields.
+class Rule {
+    var kind: string                 // match | beginEnd | include | group
+    var name: string                 // scope name applied to the whole match / region
+    var contentName: string          // scope name applied to begin/end *content*
+    var matchRe: Regex?              // compiled "match"
+    var beginRe: Regex?             // compiled "begin"
+    var endSource: string            // raw "end" (may contain \1.. backrefs to begin)
+    var endRe: Regex?               // compiled "end" when it has no backrefs
+    var endHasBackref: bool
+    var captures: map[string]string         // group index → scope (match rule)
+    var beginCaptures: map[string]string
+    var endCaptures: map[string]string
+    var patterns: []Rule             // nested / group members
+    var includeRef: string           // unresolved include target
+    var _candidates: []Rule          // cached include-resolved candidate list
+    var _resolved: bool
+
+    constructor() {
+        this.kind = "group"
+        this.name = ""
+        this.contentName = ""
+        this.matchRe = null
+        this.beginRe = null
+        this.endSource = ""
+        this.endRe = null
+        this.endHasBackref = false
+        this.captures = {}
+        this.beginCaptures = {}
+        this.endCaptures = {}
+        this.patterns = []
+        this.includeRef = ""
+        this._candidates = []
+        this._resolved = false
+    }
+}
+
+// ─── Output ──────────────────────────────────────────────────────────────────
+
+export class Token {
+    var start: int
+    var end: int
+    var scopes: []string
+    constructor(start: int, end: int, scopes: []string) {
+        this.start = start
+        this.end = end
+        this.scopes = scopes
+    }
+}
+
+// A stack frame for an active begin/end region.
+class Frame {
+    var rule: Rule
+    var endRe: Regex
+    var contentScopes: []string   // scopes active for content inside this region
+    var endScopes: []string       // scopes active for the end match itself
+    constructor(rule: Rule, endRe: Regex, contentScopes: []string, endScopes: []string) {
+        this.rule = rule
+        this.endRe = endRe
+        this.contentScopes = contentScopes
+        this.endScopes = endScopes
+    }
+}
+
+// Opaque multiline state: the rule stack carried between lines.
+export class GrammarState {
+    var frames: []Frame
+    constructor(frames: []Frame) { this.frames = frames }
+    public clone(): GrammarState {
+        var copy: []Frame = []
+        for (var i: int = 0; i < this.frames.length; i = i + 1) { copy.push(this.frames[i]) }
+        return new GrammarState(copy)
+    }
+}
+
+export class LineTokens {
+    var tokens: []Token
+    var state: GrammarState
+    constructor(tokens: []Token, state: GrammarState) {
+        this.tokens = tokens
+        this.state = state
+    }
+}
+
+// Internal: the winning candidate at a scan position.
+class Candidate {
+    var rule: Rule
+    var match: Match
+    var isEnd: bool
+    constructor(rule: Rule, match: Match, isEnd: bool) {
+        this.rule = rule
+        this.match = match
+        this.isEnd = isEnd
+    }
+}
+
+// ─── Grammar ─────────────────────────────────────────────────────────────────
+
+export class Grammar {
+    var scopeName: string
+    var rootRule: Rule
+    var repository: map[string]Rule
+
+    constructor(scopeName: string, rootRule: Rule, repository: map[string]Rule) {
+        this.scopeName = scopeName
+        this.rootRule = rootRule
+        this.repository = repository
+    }
+
+    // Parse a .tmLanguage.json string into a Grammar.
+    static load(jsonStr: string): Grammar {
+        var g: any = json.parse(jsonStr)
+        var scopeName: string = ""
+        if (g["scopeName"] != null) { scopeName = string(g["scopeName"]) }
+
+        var root: Rule = new Rule()
+        root.kind = "group"
+        root.patterns = parseRuleList(g["patterns"])
+
+        var repo: map[string]Rule = {}
+        var repoAny: any = g["repository"]
+        if (repoAny != null) {
+            var repoMap: map[string]any = repoAny
+            var keys: []string = repoMap.keys()
+            for (var i: int = 0; i < keys.length; i = i + 1) {
+                var key: string = string(keys[i])
+                repo[key] = parseRule(repoMap[key])
+            }
+        }
+        return new Grammar(scopeName, root, repo)
+    }
+
+    public initialState(): GrammarState {
+        return new GrammarState([])
+    }
+
+    // Tokenize one line. `state` carries multiline context in and out.
+    public tokenizeLine(line: string, state: GrammarState): LineTokens {
+        var tokens: []Token = []
+        var frames: []Frame = state.clone().frames
+        var lineLen: int = line.length
+        var pos: int = 0
+        var guard: int = 0
+
+        while (pos <= lineLen) {
+            guard = guard + 1
+            if (guard > lineLen + 5000) { break }   // safety against pathological loops
+
+            var topRule: Rule = this.topRule(frames)
+            var contentScopes: []string = this.currentScopes(frames)
+            var best: Candidate? = this.nextMatch(line, pos, frames, topRule)
+
+            if (best == null) {
+                if (pos < lineLen) { tokens.push(new Token(pos, lineLen, contentScopes)) }
+                break
+            }
+
+            var m: Match = best.match
+            var mStart: int = m.start()
+            var mEnd: int = m.end()
+
+            // text between the cursor and the match keeps the current scopes
+            if (mStart > pos) { tokens.push(new Token(pos, mStart, contentScopes)) }
+
+            if (best.isEnd) {
+                var top: Frame = frames[frames.length - 1]
+                this.emitCaptured(tokens, m, top.rule.endCaptures, top.endScopes)
+                frames.pop()
+            } else if (best.rule.kind == "match") {
+                var rule: Rule = best.rule
+                var scopes: []string = this.appendScope(contentScopes, rule.name)
+                this.emitCaptured(tokens, m, rule.captures, scopes)
+            } else {
+                // beginEnd: emit begin captures, push a frame
+                var br: Rule = best.rule
+                var beginScopes: []string = this.appendScope(contentScopes, br.name)
+                this.emitCaptured(tokens, m, br.beginCaptures, beginScopes)
+                var newContent: []string = beginScopes
+                if (br.contentName != "") { newContent = this.appendScope(beginScopes, br.contentName) }
+                var endRe: Regex = this.resolveEnd(br, m)
+                frames.push(new Frame(br, endRe, newContent, beginScopes))
+            }
+
+            // advance; guard against a zero-width match stalling the scan
+            if (mEnd > pos) { pos = mEnd }
+            else if (mEnd == pos && mStart == pos) {
+                if (best.isEnd || best.rule.kind == "beginEnd") {
+                    // stack changed → progress was made, keep pos
+                } else {
+                    pos = pos + 1
+                }
+            } else { pos = mEnd }
+        }
+
+        return new LineTokens(tokens, new GrammarState(frames))
+    }
+
+    // ── scope helpers ────────────────────────────────────────────────────────
+
+    private topRule(frames: []Frame): Rule {
+        if (frames.length == 0) { return this.rootRule }
+        return frames[frames.length - 1].rule
+    }
+
+    private currentScopes(frames: []Frame): []string {
+        if (frames.length == 0) {
+            if (this.scopeName == "") { return [] }
+            return [this.scopeName]
+        }
+        return frames[frames.length - 1].contentScopes
+    }
+
+    private appendScope(base: []string, scope: string): []string {
+        if (scope == "") { return base }
+        var out: []string = []
+        for (var i: int = 0; i < base.length; i = i + 1) { out.push(base[i]) }
+        out.push(scope)
+        return out
+    }
+
+    // ── matching ──────────────────────────────────────────────────────────────
+
+    // Earliest-winning candidate at `pos`. Child patterns are tried first;
+    // the end pattern wins only if it matches strictly earlier.
+    private nextMatch(line: string, pos: int, frames: []Frame, topRule: Rule): Candidate? {
+        var best: Candidate? = null
+        var bestStart: int = -1
+
+        var candidates: []Rule = this.candidatesFor(topRule)
+        for (var i: int = 0; i < candidates.length; i = i + 1) {
+            var c: Rule = candidates[i]
+            var re: Regex? = (c.kind == "match") ? c.matchRe : c.beginRe
+            if (re == null) { continue }
+            var m: Match? = re.find(line, pos)
+            if (m == null) { continue }
+            if (best == null || m.start() < bestStart) {
+                best = new Candidate(c, m, false)
+                bestStart = m.start()
+                if (bestStart == pos) { break }   // can't beat a match at the cursor
+            }
+        }
+
+        if (frames.length > 0) {
+            var top: Frame = frames[frames.length - 1]
+            var em: Match? = top.endRe.find(line, pos)
+            if (em != null) {
+                if (best == null || em.start() < bestStart) {
+                    best = new Candidate(top.rule, em, true)
+                }
+            }
+        }
+        return best
+    }
+
+    // Include-resolved candidate list for a rule, cached on the rule.
+    private candidatesFor(rule: Rule): []Rule {
+        if (rule._resolved) { return rule._candidates }
+        var out: []Rule = []
+        var visited: map[string]bool = {}
+        this.collect(rule.patterns, out, visited)
+        rule._candidates = out
+        rule._resolved = true
+        return out
+    }
+
+    private collect(patterns: []Rule, out: []Rule, visited: map[string]bool) {
+        for (var i: int = 0; i < patterns.length; i = i + 1) {
+            var p: Rule = patterns[i]
+            if (p.kind == "include") {
+                this.resolveInclude(p.includeRef, out, visited)
+            } else if (p.kind == "group") {
+                this.collect(p.patterns, out, visited)
+            } else {
+                out.push(p)   // match or beginEnd → a real candidate
+            }
+        }
+    }
+
+    private resolveInclude(ref: string, out: []Rule, visited: map[string]bool) {
+        if (ref == "" || visited.get(ref) == true) { return }
+        visited[ref] = true
+        if (ref == "$self" || ref == "$base") {
+            this.collect(this.rootRule.patterns, out, visited)
+            return
+        }
+        if (strings.charAt(ref, 0) == "#") {
+            var name: string = strings.substring(ref, 1, ref.length)
+            var target: Rule? = this.repository.get(name)
+            if (target == null) { return }
+            var t: Rule = target
+            if (t.kind == "group") { this.collect(t.patterns, out, visited) }
+            else if (t.kind == "include") { this.resolveInclude(t.includeRef, out, visited) }
+            else { out.push(t) }
+            return
+        }
+        // external grammar scope (e.g. "source.css") — not supported in v1
+    }
+
+    // Compile the end pattern for a freshly-entered region, substituting any
+    // \1..\9 backreferences with the literal text the begin match captured.
+    private resolveEnd(rule: Rule, beginMatch: Match): Regex {
+        if (!rule.endHasBackref) {
+            if (rule.endRe != null) { return rule.endRe }
+            return new Regex(rule.endSource)
+        }
+        var substituted: string = substituteBackrefs(rule.endSource, beginMatch)
+        return new Regex(substituted)
+    }
+
+    // ── capture emission ───────────────────────────────────────────────────────
+
+    // Emit tokens for a match, splitting out numbered capture groups. Captures
+    // are assumed non-overlapping and left-to-right (true for typical grammars).
+    private emitCaptured(tokens: []Token, m: Match, caps: map[string]string, baseScopes: []string) {
+        var start: int = m.start()
+        var end: int = m.end()
+        if (end <= start) { return }
+
+        var capKeys: []string = caps.keys()
+        if (capKeys.length == 0) {
+            tokens.push(new Token(start, end, baseScopes))
+            return
+        }
+
+        var cursor: int = start
+        var maxGroup: int = m.groupCount()
+        for (var g: int = 1; g <= maxGroup; g = g + 1) {
+            var scope: string? = caps.get(string(g))
+            if (scope == null) { continue }
+            var sp: []int = m.span(g)
+            if (sp[0] < 0 || sp[1] <= sp[0]) { continue }
+            if (sp[0] < cursor) { continue }   // skip overlaps we can't represent
+            if (sp[0] > cursor) { tokens.push(new Token(cursor, sp[0], baseScopes)) }
+            var capScopes: []string = this.appendScope(baseScopes, scope)
+            tokens.push(new Token(sp[0], sp[1], capScopes))
+            cursor = sp[1]
+        }
+        // group 0 scope (the whole-match "name") for any leftover region
+        if (cursor < end) { tokens.push(new Token(cursor, end, baseScopes)) }
+    }
+}
+
+// ─── JSON → Rule parsing (free functions) ────────────────────────────────────
+
+function parseRuleList(arr: any): []Rule {
+    var out: []Rule = []
+    if (arr == null) { return out }
+    var items: []any = arr
+    for (var i: int = 0; i < items.length; i = i + 1) {
+        out.push(parseRule(items[i]))
+    }
+    return out
+}
+
+function parseRule(r: any): Rule {
+    var rule: Rule = new Rule()
+    if (r == null) { return rule }
+
+    if (r["include"] != null) {
+        rule.kind = "include"
+        rule.includeRef = string(r["include"])
+        return rule
+    }
+
+    if (r["name"] != null) { rule.name = string(r["name"]) }
+    if (r["contentName"] != null) { rule.contentName = string(r["contentName"]) }
+
+    if (r["match"] != null) {
+        rule.kind = "match"
+        rule.matchRe = new Regex(string(r["match"]))
+        rule.captures = parseCaptures(r["captures"])
+        return rule
+    }
+
+    if (r["begin"] != null) {
+        rule.kind = "beginEnd"
+        rule.beginRe = new Regex(string(r["begin"]))
+        rule.beginCaptures = parseCaptures(r["beginCaptures"])
+        // a shared "captures" applies to both begin and end when the specific
+        // ones are absent
+        var shared: map[string]string = parseCaptures(r["captures"])
+        if (rule.beginCaptures.keys().length == 0) { rule.beginCaptures = shared }
+        if (r["end"] != null) {
+            rule.endSource = string(r["end"])
+            rule.endHasBackref = hasBackref(rule.endSource)
+            if (!rule.endHasBackref) { rule.endRe = new Regex(rule.endSource) }
+        }
+        rule.endCaptures = parseCaptures(r["endCaptures"])
+        if (rule.endCaptures.keys().length == 0) { rule.endCaptures = shared }
+        rule.patterns = parseRuleList(r["patterns"])
+        return rule
+    }
+
+    // group: just nested patterns
+    rule.kind = "group"
+    rule.patterns = parseRuleList(r["patterns"])
+    return rule
+}
+
+// captures: { "1": { "name": "scope" }, ... } → { "1": "scope" }
+function parseCaptures(c: any): map[string]string {
+    var out: map[string]string = {}
+    if (c == null) { return out }
+    var cm: map[string]any = c
+    var keys: []string = cm.keys()
+    for (var i: int = 0; i < keys.length; i = i + 1) {
+        var k: string = string(keys[i])
+        var entry: any = cm[k]
+        if (entry == null) { continue }
+        if (entry["name"] != null) { out[k] = string(entry["name"]) }
+    }
+    return out
+}
+
+function hasBackref(src: string): bool {
+    var n: int = src.length
+    for (var i: int = 0; i < n - 1; i = i + 1) {
+        if (strings.charAt(src, i) == "\\") {
+            var c: string = strings.charAt(src, i + 1)
+            if (c >= "1" && c <= "9") { return true }
+        }
+    }
+    return false
+}
+
+// Replace \1..\9 in an end pattern with the regex-escaped text of the begin
+// match's corresponding capture group.
+function substituteBackrefs(src: string, m: Match): string {
+    var out: string = ""
+    var n: int = src.length
+    var i: int = 0
+    while (i < n) {
+        var c: string = strings.charAt(src, i)
+        if (c == "\\" && i + 1 < n) {
+            var d: string = strings.charAt(src, i + 1)
+            if (d >= "1" && d <= "9") {
+                var g: int = int(d)
+                out = out + escapeRegex(m.group(g))
+                i = i + 2
+                continue
+            }
+            out = out + c + d
+            i = i + 2
+            continue
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+function escapeRegex(s: string): string {
+    var out: string = ""
+    var n: int = s.length
+    for (var i: int = 0; i < n; i = i + 1) {
+        var c: string = strings.charAt(s, i)
+        if (c == "\\" || c == "." || c == "*" || c == "+" || c == "?" || c == "(" || c == ")" ||
+            c == "[" || c == "]" || c == "{" || c == "}" || c == "^" || c == "$" || c == "|" || c == "/") {
+            out = out + "\\"
+        }
+        out = out + c
+    }
+    return out
+}
