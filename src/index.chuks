@@ -40,6 +40,7 @@ class Rule {
     var endCaptures: map[string]string
     var patterns: []Rule             // nested / group members
     var includeRef: string           // unresolved include target
+    var owner: Grammar?              // the grammar this rule belongs to (for #ref + scopeName)
     var _candidates: []Rule          // cached include-resolved candidate list
     var _resolved: bool
 
@@ -57,6 +58,7 @@ class Rule {
         this.endCaptures = {}
         this.patterns = []
         this.includeRef = ""
+        this.owner = null
         this._candidates = []
         this._resolved = false
     }
@@ -127,12 +129,16 @@ export class Grammar {
     var scopeName: string
     var rootRule: Rule
     var repository: map[string]Rule
+    var registry: GrammarRegistry?    // for resolving external "source.x" includes
 
     constructor(scopeName: string, rootRule: Rule, repository: map[string]Rule) {
         this.scopeName = scopeName
         this.rootRule = rootRule
         this.repository = repository
+        this.registry = null
     }
+
+    public setRegistry(reg: GrammarRegistry): void { this.registry = reg }
 
     // Parse a .tmLanguage.json string into a Grammar.
     static load(jsonStr: string): Grammar {
@@ -154,7 +160,23 @@ export class Grammar {
                 repo[key] = parseRule(repoMap[key])
             }
         }
-        return new Grammar(scopeName, root, repo)
+        var grammar: Grammar = new Grammar(scopeName, root, repo)
+        // Tag every rule with its owning grammar so #ref / external includes and
+        // scope resolution use the right context once grammars are composed.
+        grammar.assignOwner(root)
+        var repoKeys: []string = repo.keys()
+        for (var j: int = 0; j < repoKeys.length; j = j + 1) {
+            var rr: Rule? = repo.get(repoKeys[j])
+            if (rr != null) { grammar.assignOwner(rr) }
+        }
+        return grammar
+    }
+
+    // Recursively stamp `owner` on a rule and everything reachable from it.
+    private assignOwner(rule: Rule): void {
+        if (rule.owner == this) { return }   // already done (guards cycles)
+        rule.owner = this
+        for (var i: int = 0; i < rule.patterns.length; i = i + 1) { this.assignOwner(rule.patterns[i]) }
     }
 
     public initialState(): GrammarState {
@@ -279,48 +301,79 @@ export class Grammar {
         return best
     }
 
-    // Include-resolved candidate list for a rule, cached on the rule.
+    // Include-resolved candidate list for a rule, cached on the rule. Resolution
+    // happens in the rule's OWNER grammar so #ref hits the right repository and
+    // external "source.x" includes pull from the registry's other grammars.
     private candidatesFor(rule: Rule): []Rule {
         if (rule._resolved) { return rule._candidates }
+        var ownerOpt: Grammar? = rule.owner
+        var owner: Grammar = ownerOpt == null ? this : ownerOpt
         var out: []Rule = []
         var visited: map[string]bool = {}
-        this.collect(rule.patterns, out, visited)
+        owner.collect(owner, rule.patterns, out, visited)
         rule._candidates = out
         rule._resolved = true
         return out
     }
 
-    private collect(patterns: []Rule, out: []Rule, visited: map[string]bool) {
+    // collect/resolveInclude carry the grammar that OWNS the patterns being
+    // walked, so a #ref always resolves against that grammar's repository even
+    // when its rules were spliced into another grammar via an external include.
+    private collect(owner: Grammar, patterns: []Rule, out: []Rule, visited: map[string]bool) {
         for (var i: int = 0; i < patterns.length; i = i + 1) {
             var p: Rule = patterns[i]
             if (p.kind == "include") {
-                this.resolveInclude(p.includeRef, out, visited)
+                owner.resolveInclude(owner, p.includeRef, out, visited)
             } else if (p.kind == "group") {
-                this.collect(p.patterns, out, visited)
+                owner.collect(owner, p.patterns, out, visited)
             } else {
                 out.push(p)   // match or beginEnd → a real candidate
             }
         }
     }
 
-    private resolveInclude(ref: string, out: []Rule, visited: map[string]bool) {
-        if (ref == "" || visited.get(ref) == true) { return }
-        visited[ref] = true
+    private resolveInclude(owner: Grammar, ref: string, out: []Rule, visited: map[string]bool) {
+        if (ref == "") { return }
+        var visitKey: string = owner.scopeName + "|" + ref
+        if (visited.get(visitKey) == true) { return }
+        visited[visitKey] = true
         if (ref == "$self" || ref == "$base") {
-            this.collect(this.rootRule.patterns, out, visited)
+            owner.collect(owner, owner.rootRule.patterns, out, visited)
             return
         }
         if (strings.charAt(ref, 0) == "#") {
             var name: string = strings.substring(ref, 1, ref.length)
-            var target: Rule? = this.repository.get(name)
+            var target: Rule? = owner.repository.get(name)
             if (target == null) { return }
             var t: Rule = target
-            if (t.kind == "group") { this.collect(t.patterns, out, visited) }
-            else if (t.kind == "include") { this.resolveInclude(t.includeRef, out, visited) }
+            if (t.kind == "group") { owner.collect(owner, t.patterns, out, visited) }
+            else if (t.kind == "include") { owner.resolveInclude(owner, t.includeRef, out, visited) }
             else { out.push(t) }
             return
         }
-        // external grammar scope (e.g. "source.css") — not supported in v1
+        // External grammar scope, e.g. "source.css" or "text.html.basic#rule".
+        // Resolve via the shared registry; an optional "#rule" selects one rule.
+        var reg: GrammarRegistry? = owner.registry
+        if (reg == null) { return }
+        var scopePart: string = ref
+        var rulePart: string = ""
+        var hashAt: int = strings.indexOf(ref, "#")
+        if (hashAt >= 0) {
+            scopePart = strings.substring(ref, 0, hashAt)
+            rulePart = strings.substring(ref, hashAt + 1, ref.length)
+        }
+        var ext: Grammar? = reg.get(scopePart)
+        if (ext == null) { return }
+        var extG: Grammar = ext
+        if (rulePart == "") {
+            extG.collect(extG, extG.rootRule.patterns, out, visited)
+        } else {
+            var er: Rule? = extG.repository.get(rulePart)
+            if (er == null) { return }
+            var ert: Rule = er
+            if (ert.kind == "group") { extG.collect(extG, ert.patterns, out, visited) }
+            else { out.push(ert) }
+        }
     }
 
     // Compile the end pattern for a freshly-entered region, substituting any
@@ -365,6 +418,34 @@ export class Grammar {
         // group 0 scope (the whole-match "name") for any leftover region
         if (cursor < end) { tokens.push(new Token(cursor, end, baseScopes)) }
     }
+}
+
+// ─── GrammarRegistry (cross-grammar / embedded languages) ────────────────────
+// Holds grammars by scopeName so one grammar can embed another via an external
+// include (e.g. HTML's <style> block includes "source.css", markdown fences
+// include "source.js"). Add every grammar a document might reference, then use
+// any of them to tokenize — external includes resolve through the registry.
+
+export class GrammarRegistry {
+    var _byScope: map[string]Grammar
+
+    constructor() { this._byScope = {} }
+
+    // Register a grammar (keyed by its scopeName) and wire it to this registry.
+    public add(grammar: Grammar): void {
+        this._byScope[grammar.scopeName] = grammar
+        grammar.setRegistry(this)
+    }
+
+    // Parse + register a grammar JSON in one step; returns it.
+    public load(jsonStr: string): Grammar {
+        var g: Grammar = Grammar.load(jsonStr)
+        this.add(g)
+        return g
+    }
+
+    public get(scopeName: string): Grammar? { return this._byScope.get(scopeName) }
+    public has(scopeName: string): bool { return this._byScope.get(scopeName) != null }
 }
 
 // ─── JSON → Rule parsing (free functions) ────────────────────────────────────
@@ -488,4 +569,253 @@ function escapeRegex(s: string): string {
         out = out + c
     }
     return out
+}
+
+// ─── Theme (scope → color/style resolution) ──────────────────────────────────
+// The second half of a syntax highlighter: a TextMate/VS Code theme maps a
+// token's scope stack to a foreground color and font style. Together with the
+// grammar tokenizer above, this is a full Shiki-equivalent in pure Chuks.
+
+export class Style {
+    var foreground: string   // "#rrggbb" or "" when unset
+    var bold: bool
+    var italic: bool
+    var underline: bool
+    constructor(foreground: string, bold: bool, italic: bool, underline: bool) {
+        this.foreground = foreground
+        this.bold = bold
+        this.italic = italic
+        this.underline = underline
+    }
+}
+
+// One parsed tokenColors entry.
+class ThemeRule {
+    var selectors: []string  // scope selectors (each may be a space-separated descendant path)
+    var foreground: string
+    var hasStyle: bool
+    var bold: bool
+    var italic: bool
+    var underline: bool
+    constructor() {
+        this.selectors = []
+        this.foreground = ""
+        this.hasStyle = false
+        this.bold = false
+        this.italic = false
+        this.underline = false
+    }
+}
+
+export class Theme {
+    var name: string
+    var type: string            // "dark" | "light"
+    var _defaultFg: string
+    var _defaultBg: string
+    var _rules: []ThemeRule
+
+    constructor(name: string, type: string, defaultFg: string, defaultBg: string, rules: []ThemeRule) {
+        this.name = name
+        this.type = type
+        this._defaultFg = defaultFg
+        this._defaultBg = defaultBg
+        this._rules = rules
+    }
+
+    public defaultForeground(): string { return this._defaultFg }
+    public background(): string { return this._defaultBg }
+
+    // Parse a VS Code / TextMate theme JSON (the shape Shiki ships).
+    static load(jsonStr: string): Theme {
+        var t: any = json.parse(jsonStr)
+        var name: string = t["name"] != null ? string(t["name"]) : ""
+        var type: string = t["type"] != null ? string(t["type"]) : "dark"
+
+        var colors: any = t["colors"]
+        var defaultFg: string = "#e5e7eb"
+        var defaultBg: string = "#1e1e1e"
+        if (t["fg"] != null && string(t["fg"]) != "") { defaultFg = string(t["fg"]) }
+        else if (colors != null && colors["editor.foreground"] != null) { defaultFg = string(colors["editor.foreground"]) }
+        if (t["bg"] != null && string(t["bg"]) != "") { defaultBg = string(t["bg"]) }
+        else if (colors != null && colors["editor.background"] != null) { defaultBg = string(colors["editor.background"]) }
+
+        var rules: []ThemeRule = []
+        var tc: any = t["tokenColors"]
+        if (tc != null) {
+            var items: []any = tc
+            for (var i: int = 0; i < items.length; i = i + 1) {
+                var entry: any = items[i]
+                var settings: any = entry["settings"]
+                if (settings == null) { continue }
+                var rule: ThemeRule = new ThemeRule()
+                if (settings["foreground"] != null) { rule.foreground = string(settings["foreground"]) }
+                if (settings["fontStyle"] != null) {
+                    rule.hasStyle = true
+                    var fs: string = string(settings["fontStyle"])
+                    rule.bold = strings.contains(fs, "bold")
+                    rule.italic = strings.contains(fs, "italic")
+                    rule.underline = strings.contains(fs, "underline")
+                }
+                var scopeAny: any = entry["scope"]
+                rule.selectors = normalizeScope(scopeAny)
+                if (rule.selectors.length == 0) {
+                    // A settings entry with no scope is the theme default.
+                    if (rule.foreground != "") { defaultFg = rule.foreground }
+                    continue
+                }
+                rules.push(rule)
+            }
+        }
+        return new Theme(name, type, defaultFg, defaultBg, rules)
+    }
+
+    // Resolve the style for a token's scope stack (root → most specific).
+    public resolve(scopes: []string): Style {
+        var fg: string = this._defaultFg
+        var bold: bool = false
+        var italic: bool = false
+        var underline: bool = false
+        var bestFg: int = 0
+        var bestStyle: int = 0
+
+        for (var i: int = 0; i < this._rules.length; i = i + 1) {
+            var rule: ThemeRule = this._rules[i]
+            var score: int = 0
+            for (var s: int = 0; s < rule.selectors.length; s = s + 1) {
+                var sc: int = selectorScore(rule.selectors[s], scopes)
+                if (sc > score) { score = sc }
+            }
+            if (score == 0) { continue }
+            // Ties go to later rules (VS Code semantics): use >=.
+            if (rule.foreground != "" && score >= bestFg) { bestFg = score; fg = rule.foreground }
+            if (rule.hasStyle && score >= bestStyle) {
+                bestStyle = score; bold = rule.bold; italic = rule.italic; underline = rule.underline
+            }
+        }
+        return new Style(fg, bold, italic, underline)
+    }
+}
+
+// scope can be a string ("a, b") or an array of strings. Returns the selectors.
+function normalizeScope(scopeAny: any): []string {
+    var out: []string = []
+    if (scopeAny == null) { return out }
+    if (typeof(scopeAny) == "array") {
+        var items: []any = scopeAny
+        for (var i: int = 0; i < items.length; i = i + 1) {
+            splitSelectors(string(items[i]), out)
+        }
+    } else {
+        splitSelectors(string(scopeAny), out)
+    }
+    return out
+}
+
+function splitSelectors(raw: string, out: []string) {
+    // A scope string may hold comma-separated selectors.
+    var parts: []string = strings.split(raw, ",")
+    for (var i: int = 0; i < parts.length; i = i + 1) {
+        var p: string = strings.trim(parts[i])
+        if (p != "") { out.push(p) }
+    }
+}
+
+// Score how well a selector matches a scope stack. 0 = no match; higher = more
+// specific. A selector is a space-separated descendant path; each part matches a
+// scope if it equals it or is a dotted prefix of it. Parts must match in
+// ancestor order, with the last part deepest.
+function selectorScore(selector: string, scopes: []string): int {
+    var parts: []string = []
+    var raw: []string = strings.split(selector, " ")
+    for (var i: int = 0; i < raw.length; i = i + 1) {
+        var p: string = strings.trim(raw[i])
+        if (p != "") { parts.push(p) }
+    }
+    if (parts.length == 0) { return 0 }
+
+    var partIdx: int = parts.length - 1
+    var scopeIdx: int = scopes.length - 1
+    var deepest: int = -1
+    while (partIdx >= 0 && scopeIdx >= 0) {
+        if (scopeSelectorMatches(scopes[scopeIdx], parts[partIdx])) {
+            if (deepest < 0) { deepest = scopeIdx }
+            partIdx = partIdx - 1
+            scopeIdx = scopeIdx - 1
+        } else {
+            scopeIdx = scopeIdx - 1
+        }
+    }
+    if (partIdx >= 0) { return 0 }   // some part never matched
+
+    var specificity: int = 0
+    for (var k: int = 0; k < parts.length; k = k + 1) { specificity = specificity + segmentCount(parts[k]) }
+    return specificity * 10000 + (deepest + 1)
+}
+
+function scopeSelectorMatches(scope: string, sel: string): bool {
+    if (scope == sel) { return true }
+    return strings.startsWith(scope, sel + ".")
+}
+
+function segmentCount(s: string): int {
+    var n: int = 1
+    for (var i: int = 0; i < s.length; i = i + 1) {
+        if (strings.charAt(s, i) == ".") { n = n + 1 }
+    }
+    return n
+}
+
+// ─── Highlighter (grammar + theme → styled tokens) ───────────────────────────
+
+export class StyledToken {
+    var start: int
+    var end: int
+    var text: string
+    var foreground: string
+    var bold: bool
+    var italic: bool
+    constructor(start: int, end: int, text: string, foreground: string, bold: bool, italic: bool) {
+        this.start = start
+        this.end = end
+        this.text = text
+        this.foreground = foreground
+        this.bold = bold
+        this.italic = italic
+    }
+}
+
+export class StyledLine {
+    var tokens: []StyledToken
+    var state: GrammarState
+    constructor(tokens: []StyledToken, state: GrammarState) {
+        this.tokens = tokens
+        this.state = state
+    }
+}
+
+// Ties a grammar to a theme. highlightLine returns drawable tokens — text +
+// color + font style — exactly what a canvas/HTML renderer consumes.
+export class Highlighter {
+    var grammar: Grammar
+    var theme: Theme
+    constructor(grammar: Grammar, theme: Theme) {
+        this.grammar = grammar
+        this.theme = theme
+    }
+
+    public initialState(): GrammarState { return this.grammar.initialState() }
+    public defaultForeground(): string { return this.theme.defaultForeground() }
+    public background(): string { return this.theme.background() }
+
+    public highlightLine(line: string, state: GrammarState): StyledLine {
+        var lt: LineTokens = this.grammar.tokenizeLine(line, state)
+        var out: []StyledToken = []
+        for (var i: int = 0; i < lt.tokens.length; i = i + 1) {
+            var t: Token = lt.tokens[i]
+            var st: Style = this.theme.resolve(t.scopes)
+            var text: string = strings.substring(line, t.start, t.end)
+            out.push(new StyledToken(t.start, t.end, text, st.foreground, st.bold, st.italic))
+        }
+        return new StyledLine(out, lt.state)
+    }
 }

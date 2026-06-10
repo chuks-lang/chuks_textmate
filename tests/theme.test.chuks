@@ -1,0 +1,84 @@
+// Theme + Highlighter tests for @chuks/textmate.
+import { test } from "std/test"
+import { Grammar, Theme, Style, Highlighter, StyledLine, StyledToken, GrammarState } from "../src/index.chuks"
+
+var passed: int = 0
+var failed: int = 0
+var failures: []string = []
+const start = test.now()
+function eq(name: string, got: string, want: string) {
+    if (test.assertEqual(got, want, name)) { passed++ } else { failed++; failures.push(name + ": [" + got + "] != [" + want + "]") }
+}
+function ok(name: string, cond: bool) {
+    if (test.assert(cond, name)) { passed++ } else { failed++; failures.push(name) }
+}
+
+// A VS Code-shape theme (scope array, comma strings, descendant selector, default).
+const THEME: string = "{" +
+  "\"name\": \"test-dark\", \"type\": \"dark\"," +
+  "\"colors\": { \"editor.foreground\": \"#d4d4d4\", \"editor.background\": \"#1e1e1e\" }," +
+  "\"tokenColors\": [" +
+    "{ \"settings\": { \"foreground\": \"#cccccc\" } }," +
+    "{ \"scope\": \"comment\", \"settings\": { \"foreground\": \"#6a9955\", \"fontStyle\": \"italic\" } }," +
+    "{ \"scope\": [\"keyword\", \"keyword.control\"], \"settings\": { \"foreground\": \"#569cd6\", \"fontStyle\": \"bold\" } }," +
+    "{ \"scope\": \"string\", \"settings\": { \"foreground\": \"#ce9178\" } }," +
+    "{ \"scope\": \"constant.numeric\", \"settings\": { \"foreground\": \"#b5cea8\" } }," +
+    "{ \"scope\": \"string constant.character.escape\", \"settings\": { \"foreground\": \"#d7ba7d\" } }" +
+  "]" +
+"}"
+
+var theme: Theme = Theme.load(THEME)
+eq("default-fg", theme.defaultForeground(), "#cccccc")   // no-scope rule overrides editor.foreground
+eq("bg", theme.background(), "#1e1e1e")
+
+// resolve by scope stack
+eq("r-keyword", theme.resolve(["source.x", "keyword.control"]).foreground, "#569cd6")
+ok("r-keyword-bold", theme.resolve(["source.x", "keyword.control"]).bold)
+eq("r-comment", theme.resolve(["source.x", "comment.line"]).foreground, "#6a9955")
+ok("r-comment-italic", theme.resolve(["source.x", "comment.line"]).italic)
+eq("r-number", theme.resolve(["source.x", "constant.numeric"]).foreground, "#b5cea8")
+eq("r-default", theme.resolve(["source.x"]).foreground, "#cccccc")
+// descendant selector beats plain "string" on the escape token
+eq("r-escape", theme.resolve(["source.x", "string.quoted.double", "constant.character.escape"]).foreground, "#d7ba7d")
+eq("r-string", theme.resolve(["source.x", "string.quoted.double"]).foreground, "#ce9178")
+
+// ─── Highlighter: grammar + theme → drawable tokens ──────────────────────────
+const GRAMMAR: string = "{" +
+  "\"scopeName\": \"source.mini\"," +
+  "\"patterns\": [" +
+    "{ \"match\": \"//.*$\", \"name\": \"comment.line\" }," +
+    "{ \"begin\": \"\\\"\", \"end\": \"\\\"\", \"name\": \"string.quoted.double\"," +
+      "\"patterns\": [ { \"match\": \"\\\\\\\\.\", \"name\": \"constant.character.escape\" } ] }," +
+    "{ \"match\": \"\\\\b(let|const)\\\\b\", \"name\": \"keyword.control\" }," +
+    "{ \"match\": \"\\\\b\\\\d+\\\\b\", \"name\": \"constant.numeric\" }" +
+  "]" +
+"}"
+
+var hl: Highlighter = new Highlighter(Grammar.load(GRAMMAR), theme)
+var line: StyledLine = hl.highlightLine("let x = 42 // hi", hl.initialState())
+
+// find token by start
+function tokAt(l: StyledLine, pos: int): StyledToken? {
+    for (var i: int = 0; i < l.tokens.length; i = i + 1) {
+        var t: StyledToken = l.tokens[i]
+        if (pos >= t.start && pos < t.end) { return t }
+    }
+    return null
+}
+function fgAt(l: StyledLine, pos: int): string {
+    var t: StyledToken? = tokAt(l, pos)
+    if (t == null) { return "<none>" }
+    return t.foreground
+}
+
+eq("hl-keyword", fgAt(line, 0), "#569cd6")   // let
+eq("hl-number", fgAt(line, 8), "#b5cea8")    // 42
+eq("hl-comment", fgAt(line, 11), "#6a9955")  // //
+eq("hl-text", fgAt(line, 4), "#cccccc")      // "x" → default fg
+
+// string with escape spanning the scope stack
+var sline: StyledLine = hl.highlightLine("\"a\\nb\"", hl.initialState())
+eq("hl-str", fgAt(sline, 0), "#ce9178")      // opening quote
+eq("hl-escape", fgAt(sline, 2), "#d7ba7d")   // \n via descendant selector
+
+test.report(passed, failed, failures, test.now() - start)

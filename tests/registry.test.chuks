@@ -1,0 +1,86 @@
+// External-grammar include tests — embedded languages via GrammarRegistry.
+import { test } from "std/test"
+import { Grammar, GrammarRegistry, GrammarState, LineTokens, Token } from "../src/index.chuks"
+
+var passed: int = 0
+var failed: int = 0
+var failures: []string = []
+const start = test.now()
+function eq(name: string, got: string, want: string) {
+    if (test.assertEqual(got, want, name)) { passed++ } else { failed++; failures.push(name + ": [" + got + "] != [" + want + "]") }
+}
+
+// Embedded grammar: a tiny "CSS" — property names and numbers.
+const CSS: string = "{" +
+  "\"scopeName\": \"source.css\"," +
+  "\"patterns\": [" +
+    "{ \"match\": \"\\\\b[a-z-]+(?=\\\\s*:)\", \"name\": \"support.type.property-name.css\" }," +
+    "{ \"match\": \"\\\\b\\\\d+\\\\b\", \"name\": \"constant.numeric.css\" }" +
+  "]" +
+"}"
+
+// Host grammar: a tiny "HTML" — tags, and a <style>…</style> block whose CONTENT
+// is delegated to source.css via an external include.
+const HTML: string = "{" +
+  "\"scopeName\": \"text.html\"," +
+  "\"patterns\": [" +
+    "{ \"include\": \"#style\" }," +
+    "{ \"match\": \"</?[a-z]+>\", \"name\": \"entity.name.tag\" }" +
+  "]," +
+  "\"repository\": {" +
+    "\"style\": {" +
+      "\"begin\": \"<style>\", \"end\": \"</style>\"," +
+      "\"name\": \"meta.style\", \"contentName\": \"source.css\"," +
+      "\"patterns\": [ { \"include\": \"source.css\" } ]" +
+    "}" +
+  "}" +
+"}"
+
+var reg: GrammarRegistry = new GrammarRegistry()
+reg.load(CSS)
+var html: Grammar = reg.load(HTML)
+
+function lastScope(t: Token): string {
+    if (t.scopes.length == 0) { return "<none>" }
+    return t.scopes[t.scopes.length - 1]
+}
+function scopeAt(r: LineTokens, pos: int): string {
+    for (var i: int = 0; i < r.tokens.length; i = i + 1) {
+        var t: Token = r.tokens[i]
+        if (pos >= t.start && pos < t.end) { return lastScope(t) }
+    }
+    return "<gap>"
+}
+function hasScope(r: LineTokens, pos: int, scope: string): bool {
+    for (var i: int = 0; i < r.tokens.length; i = i + 1) {
+        var t: Token = r.tokens[i]
+        if (pos >= t.start && pos < t.end) {
+            for (var j: int = 0; j < t.scopes.length; j = j + 1) { if (t.scopes[j] == scope) { return true } }
+        }
+    }
+    return false
+}
+
+// Plain HTML tag tokenizes via the host grammar.
+var st: GrammarState = html.initialState()
+var l1: LineTokens = html.tokenizeLine("<div>", st)
+eq("tag", scopeAt(l1, 0), "entity.name.tag")
+
+// Inside <style>, the embedded CSS grammar tokenizes the content.
+var ms: GrammarState = html.initialState()
+var s1: LineTokens = html.tokenizeLine("<style>", ms)
+eq("style-open", scopeAt(s1, 0), "meta.style")
+ms = s1.state
+var s2: LineTokens = html.tokenizeLine("color: 42", ms)
+// "color" is a CSS property-name (from the embedded grammar), 42 is CSS numeric
+eq("css-prop", scopeAt(s2, 0), "support.type.property-name.css")
+eq("css-num", scopeAt(s2, 7), "constant.numeric.css")
+// the embedding contentName scope is still on the stack underneath
+test.assert(hasScope(s2, 0, "source.css"), "embedded content carries source.css") ? passed++ : failed++
+
+ms = s2.state
+var s3: LineTokens = html.tokenizeLine("</style>", ms)
+eq("style-close", scopeAt(s3, 0), "meta.style")
+test.assert(s3.state.frames.length == 0, "style block closed") ? passed++ : failed++
+
+test.report(passed, failed, failures, test.now() - start)

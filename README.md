@@ -37,8 +37,43 @@ for (var line of sourceLines) {
 ```
 
 Each token's `scopes` is the full stack from the grammar's root scope down to the
-most specific. Map the **last** scope (or the whole stack) to a color through a
-theme to render highlighted code.
+most specific. To go straight to colors, use a `Theme` + `Highlighter` (below)
+instead of `tokenizeLine` — a complete syntax highlighter, pure Chuks.
+
+## Full highlighting (grammar + theme)
+
+```chuks
+import { Grammar, Theme, Highlighter } from "pkg/@chuks/textmate"
+
+var hl = new Highlighter(Grammar.load(grammarJson), Theme.load(themeJson))
+var state = hl.initialState()
+for (var line of sourceLines) {
+    var styled = hl.highlightLine(line, state)
+    for (var t of styled.tokens) {
+        // t.text, t.foreground ("#rrggbb"), t.bold, t.italic
+    }
+    state = styled.state
+}
+```
+
+`Theme.load` accepts a VS Code / TextMate theme JSON (the shape Shiki ships).
+`Theme.resolve(scopes)` returns a `Style { foreground, bold, italic, underline }`
+using TextMate scope-selector specificity (descendant selectors, scope arrays,
+comma lists, the no-scope default).
+
+## Embedded languages
+
+Use a `GrammarRegistry` when one grammar embeds another (HTML's `<style>` →
+`source.css`, markdown fences → `source.js`, …):
+
+```chuks
+import { GrammarRegistry } from "pkg/@chuks/textmate"
+
+var reg = new GrammarRegistry()
+reg.load(cssGrammarJson)              // register source.css
+var html = reg.load(htmlGrammarJson)  // its `{include:"source.css"}` now resolves
+var r = html.tokenizeLine("color: red", state)
+```
 
 ## Supported grammar constructs
 
@@ -46,15 +81,15 @@ theme to render highlighted code.
 |--------------------------|-----------|
 | `match` rules            | ✅ with numbered `captures` → sub-scopes |
 | `begin` / `end` rules    | ✅ with `beginCaptures`, `endCaptures`, `contentName`, nested `patterns` |
-| `include`                | ✅ `$self`, `$base`, `#repository-ref` |
+| `include`                | ✅ `$self`, `$base`, `#repository-ref`, and external `source.x` / `source.x#rule` via `GrammarRegistry` |
 | `repository`             | ✅ |
+| Embedded languages       | ✅ cross-grammar includes through `GrammarRegistry` |
 | Multiline regions        | ✅ state carried across lines via `GrammarState` |
 | Backreference `end`      | ✅ `\1`-style heredoc delimiters substituted from the `begin` match |
 | Scope stacks             | ✅ accumulated root → leaf per token |
+| Theme resolution         | ✅ VS Code themes → per-token color + font style |
 
-Not yet supported: `while` rules, injection grammars, and cross-grammar
-`include`s of external scopes (e.g. embedding `source.css` inside HTML) — these
-are on the roadmap.
+Not yet supported: `while` rules and injection grammars — on the roadmap.
 
 ## API
 
@@ -87,6 +122,46 @@ Opaque multiline context (the active rule stack). Create one with
 `g.initialState()` per document, thread the `result.state` from each line into the
 next. `state.clone()` is available if you need to fork it.
 
+### `class Theme`
+
+```chuks
+Theme.load(jsonStr: string): Theme       // VS Code / TextMate theme JSON
+theme.resolve(scopes: []string): Style   // best style for a scope stack
+theme.defaultForeground(): string        // editor foreground
+theme.background(): string               // editor background
+```
+
+### `class Style`
+
+```chuks
+style.foreground: string   // "#rrggbb" ("" if unset)
+style.bold: bool
+style.italic: bool
+style.underline: bool
+```
+
+### `class Highlighter`
+
+```chuks
+new Highlighter(grammar: Grammar, theme: Theme)
+hl.initialState(): GrammarState
+hl.highlightLine(line, state): StyledLine   // .tokens: []StyledToken, .state
+hl.defaultForeground(): string
+hl.background(): string
+```
+
+`StyledToken` carries `start`, `end`, `text`, `foreground`, `bold`, `italic`.
+
+### `class GrammarRegistry`
+
+```chuks
+new GrammarRegistry()
+reg.load(jsonStr: string): Grammar    // parse + register (keyed by scopeName)
+reg.add(grammar: Grammar): void
+reg.get(scopeName: string): Grammar?
+reg.has(scopeName: string): bool
+```
+
 ## How it works
 
 `Grammar.load` parses the grammar JSON into a tree of compiled rules (each `match` /
@@ -104,9 +179,9 @@ chuks run tests/index.test.chuks                          # VM
 chuks build tests/index.test.chuks -o /tmp/t && /tmp/t    # AOT
 ```
 
-21 assertions — match rules, captures, includes, multiline block comments,
-heredoc backreference delimiters, and scope stacks — green on both the bytecode VM
-and the AOT native backend.
+44 assertions across `tests/index.test.chuks` (grammar), `tests/theme.test.chuks`
+(theme + highlighter) and `tests/registry.test.chuks` (embedded languages) —
+green on both the bytecode VM and the AOT native backend.
 
 ## License
 
